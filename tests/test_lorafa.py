@@ -516,3 +516,131 @@ def test_lorafa_step_with_closure():
     grad = model.get_base_model()[0].lora_B["default"].weight.grad
     assert grad is not None
     assert torch.count_nonzero(grad) > 0
+
+
+@pytest.mark.parametrize("trainable_a", [False, True])
+def test_lorafa_reuses_only_frozen_preconditioners(monkeypatch, trainable_a):
+    from peft.optimizers.lorafa import LoraFAOptimizer
+
+    torch.manual_seed(123)
+    a = nn.Parameter(torch.randn(3, 7), requires_grad=trainable_a)
+    b = nn.Parameter(torch.randn(5, 3))
+    optimizer = LoraFAOptimizer([{"params": [a, b], "names": ["lora_A", "lora_B"], "scaling_factors": [2, 2]}])
+    original_pinv = torch.linalg.pinv
+    calls = []
+
+    def pinv(matrix):
+        calls.append(matrix.clone())
+        return original_pinv(matrix)
+
+    monkeypatch.setattr(torch.linalg, "pinv", pinv)
+    for _ in range(3):
+        b.grad = torch.ones_like(b)
+        optimizer.step()
+    assert len(calls) == (3 if trainable_a else 1)
+
+
+@pytest.mark.parametrize("change", ["copy", "storage", "dtype", "default_dtype", "autocast", "restore", "clear"])
+def test_lorafa_preconditioner_invalidates_after_factor_or_precision_change(change, monkeypatch):
+    from peft.optimizers.lorafa import LoraFAOptimizer
+
+    torch.manual_seed(41)
+    a = nn.Parameter(torch.randn(3, 7), requires_grad=False)
+    b = nn.Parameter(torch.randn(5, 3))
+    optimizer = LoraFAOptimizer([{"params": [a, b], "names": ["lora_A", "lora_B"], "scaling_factors": [2, 2]}])
+    original_pinv = torch.linalg.pinv
+    calls = []
+
+    def pinv(matrix):
+        calls.append(matrix.clone())
+        return original_pinv(matrix)
+
+    monkeypatch.setattr(torch.linalg, "pinv", pinv)
+    with torch.no_grad():
+        optimizer._get_preconditioner(a)
+        optimizer._get_preconditioner(a)
+        assert len(calls) == 1
+        old_dtype = torch.get_default_dtype()
+        try:
+            if change == "copy":
+                a.copy_(torch.randn_like(a))
+            elif change == "storage":
+                a.data = torch.randn_like(a)
+            elif change == "dtype":
+                a.data = a.double()
+            elif change == "default_dtype":
+                torch.set_default_dtype(torch.float64)
+            elif change == "restore":
+                optimizer.load_state_dict(optimizer.state_dict())
+            elif change == "clear":
+                a.data.add_(0.1)  # `.data` writes bypass PyTorch's version counter.
+                optimizer.clear_preconditioner_cache()
+            with torch.autocast("cpu", dtype=torch.bfloat16, enabled=change == "autocast"):
+                actual = optimizer._get_preconditioner(a)
+                assert len(calls) == 2
+                expected = original_pinv(a @ a.T + 1e-8 * torch.eye(a.shape[0]).to(a.device))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            torch.set_default_dtype(old_dtype)
+
+
+def test_lorafa_cached_training_matches_recomputation_through_resume():
+    import copy
+
+    torch.manual_seed(51)
+    config = LoraConfig(r=4, lora_alpha=8, target_modules=["lin0", "lin1"])
+    model = get_peft_model(SimpleNet(), config).cpu()
+    reference = copy.deepcopy(model)
+    optimizer = create_lorafa_optimizer(model, r=4, lora_alpha=8, lr=0.01, weight_decay=0.1)
+    reference_optimizer = create_lorafa_optimizer(reference, r=4, lora_alpha=8, lr=0.01, weight_decay=0.1)
+    inputs = torch.randint(100, (2, 3))
+    for step in range(6):
+        if step == 2:
+            # Adapter reload modifies frozen factors in-place.
+            state = copy.deepcopy(model.state_dict())
+            for name in state:
+                if "lora_A" in name:
+                    state[name].add_(0.1)
+            model.load_state_dict(state)
+            reference.load_state_dict(state)
+        if step == 4:
+            saved = copy.deepcopy(optimizer.state_dict())
+            assert set(saved) == {"state", "param_groups"}
+            assert all(set(value) == {"step", "exp_avg_B", "exp_avg_sq_B"} for value in saved["state"].values())
+            optimizer.load_state_dict(saved)
+            assert not optimizer._preconditioner_cache
+        reference_optimizer.clear_preconditioner_cache()
+        for current_model, current_optimizer in [(model, optimizer), (reference, reference_optimizer)]:
+            current_optimizer.zero_grad()
+            current_model(inputs).square().mean().backward()
+            current_optimizer.step()
+        for actual, expected in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("restore", ["deepcopy", "pickle"])
+def test_lorafa_optimizer_copy_rebuilds_derived_preconditioner(restore):
+    import copy
+    import io
+
+    from peft.optimizers.lorafa import LoraFAOptimizer
+
+    torch.manual_seed(71)
+    a = nn.Parameter(torch.randn(3, 7), requires_grad=False)
+    b = nn.Parameter(torch.randn(5, 3))
+    optimizer = LoraFAOptimizer([{"params": [a, b], "names": ["lora_A", "lora_B"], "scaling_factors": [2, 2]}])
+    b.grad = torch.ones_like(b)
+    optimizer.step()
+    if restore == "deepcopy":
+        restored = copy.deepcopy(optimizer)
+    else:
+        stream = io.BytesIO()
+        torch.save(optimizer, stream)
+        stream.seek(0)
+        restored = torch.load(stream, weights_only=False)
+    restored_b = restored.param_groups[0]["params"][1]
+    b.grad = torch.ones_like(b)
+    restored_b.grad = b.grad.clone()
+    optimizer.step()
+    restored.step()
+    torch.testing.assert_close(restored_b, b, rtol=0, atol=0)

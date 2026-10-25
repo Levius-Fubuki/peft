@@ -568,6 +568,9 @@ LoRA training can optionally include special purpose optimizers. Currently PEFT 
 
 LoRA training can be more effective and efficient using LoRA-FA, as described in [LoRA-FA](https://huggingface.co/papers/2308.03303). LoRA-FA reduces activation memory consumption by fixing the matrix A and only tuning the matrix B. During training, the gradient of B is optimized to approximate the full parameter fine-tuning gradient. Moreover, the memory consumption of LoRA-FA is not sensitive to the rank (since it erases the activation of $A$), therefore it can improve performance by enlarging lora rank without increasing memory consumption.
 
+The optimizer caches the preconditioner for each frozen A matrix and recomputes it when the weights, device, dtype, or precision policy change. These derived matrices are excluded from `state_dict`; loading optimizer state clears the cache. Normal in-place weight updates and adapter loading invalidate it automatically. If you modify A through `.data` in-place (which bypasses PyTorch's version counter), call `optimizer.clear_preconditioner_cache()` before the next step. Trainable A matrices are recomputed on every step.
+
+
 ```py
 from peft import LoraConfig, get_peft_model
 from peft.optimizers import create_lorafa_optimizer

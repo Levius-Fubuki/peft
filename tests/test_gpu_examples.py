@@ -7476,3 +7476,38 @@ class TestKappaTune:
         # loose bound. Without dequantization, the condition numbers would be off by a much larger factor.
         for name, kappa_fp in kappas_fp.items():
             assert 0.5 < kappas_8bit[name] / kappa_fp < 2
+
+
+@pytest.mark.single_gpu_tests
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="Requires BF16-capable CUDA"
+)
+@pytest.mark.parametrize(
+    "policy", ["allow_fp16_reduced_precision_reduction", "allow_bf16_reduced_precision_reduction"]
+)
+def test_lorafa_cache_invalidates_on_cuda_reduction_policy_change(policy, monkeypatch):
+    from peft.optimizers.lorafa import LoraFAOptimizer
+
+    torch.manual_seed(91)
+    a = torch.nn.Parameter(torch.randn(8, 32, device="cuda"), requires_grad=False)
+    b = torch.nn.Parameter(torch.randn(16, 8, device="cuda"))
+    optimizer = LoraFAOptimizer([{"params": [a, b], "names": ["lora_A", "lora_B"], "scaling_factors": [2, 2]}])
+    original_pinv = torch.linalg.pinv
+    calls = []
+
+    def pinv(matrix):
+        calls.append(matrix.clone())
+        return original_pinv(matrix)
+
+    monkeypatch.setattr(torch.linalg, "pinv", pinv)
+    old_policy = getattr(torch.backends.cuda.matmul, policy)
+    try:
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            optimizer._get_preconditioner(a)
+            setattr(torch.backends.cuda.matmul, policy, not old_policy)
+            actual = optimizer._get_preconditioner(a)
+            assert len(calls) == 2
+            expected = original_pinv(a @ a.T + 1e-8 * torch.eye(a.shape[0], device=a.device))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        setattr(torch.backends.cuda.matmul, policy, old_policy)

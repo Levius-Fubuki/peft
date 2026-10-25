@@ -80,6 +80,61 @@ class LoraFAOptimizer(Optimizer):
         super().__init__(params, defaults)
         # Warn once per optimizer instance so the deprecation path does not spam every training step
         self._legacy_scaling_factor_warned = False
+        # Derived tensors belong to this optimizer instance, not its checkpoint state.
+        self._preconditioner_cache = {}
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._preconditioner_cache = {}
+        self._legacy_scaling_factor_warned = False
+
+    def clear_preconditioner_cache(self):
+        """Discard frozen-A preconditioners, e.g. after modifying weights through `.data`.
+
+        Normal in-place updates and `load_state_dict` invalidate the cache automatically.
+        """
+        self._preconditioner_cache.clear()
+
+    def load_state_dict(self, state_dict):
+        result = super().load_state_dict(state_dict)
+        self.clear_preconditioner_cache()
+        return result
+
+    def _get_preconditioner(self, A):
+        # Autocast changes the Gram matrix's precision; never reuse across precision policies.
+        if hasattr(torch, "get_autocast_dtype"):
+            autocast_dtype = (
+                torch.get_autocast_dtype(A.device.type) if torch.is_autocast_enabled(A.device.type) else None
+            )
+        elif A.device.type == "cpu":
+            autocast_dtype = torch.get_autocast_cpu_dtype() if torch.is_autocast_cpu_enabled() else None
+        else:
+            autocast_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else None
+        signature = (
+            A._version,
+            A.data_ptr(),
+            A.device,
+            A.dtype,
+            A.shape,
+            A.stride(),
+            torch.get_default_dtype(),
+            torch.get_float32_matmul_precision(),
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            getattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False),
+            autocast_dtype,
+        )
+        cached = self._preconditioner_cache.get(A)
+        if not A.requires_grad and cached is not None and cached[0] == signature:
+            return cached[1]
+
+        AA_T = A @ A.T
+        inverse = torch.linalg.pinv(AA_T + 1e-8 * torch.eye(A.shape[0]).to(A.device))
+        if not A.requires_grad:
+            self._preconditioner_cache[A] = (signature, inverse)
+        else:
+            self._preconditioner_cache.pop(A, None)
+        return inverse
 
     @torch.no_grad()
     def step(self, closure: Callable | None = None):
@@ -163,12 +218,7 @@ class LoraFAOptimizer(Optimizer):
                     B = param_list[1]
                     grad_B_orin = B.grad
 
-                    # projection
-                    delta = 1e-8
-
-                    # computing the inverse matrix
-                    AA_T = A @ A.T
-                    AA_T_inv = torch.linalg.pinv(AA_T + delta * torch.eye(A.shape[0]).to(A.device))
+                    AA_T_inv = self._get_preconditioner(A)
 
                     device_type = infer_device()
 
